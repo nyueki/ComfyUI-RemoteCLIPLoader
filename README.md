@@ -22,7 +22,7 @@ Installation
 1. Go to your ComfyUI installation's custom_nodes folder:
    cd /path/to/ComfyUI/custom_nodes
 2. Clone this repository:
-   git clone 
+   git clone https://github.com/nyueki/ComfyUI-RemoteCLIPLoader.git
 3. Restart ComfyUI.
 
 Usage
