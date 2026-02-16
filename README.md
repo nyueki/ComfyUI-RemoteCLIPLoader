@@ -1,142 +1,71 @@
 # 🌐 Remote CLIP for ComfyUI
 
-Run **CLIP text encoding on a different machine** and use it seamlessly inside **ComfyUI** 🚀
-Perfect for offloading heavy CLIP models to another PC or server.
+**Offload heavy CLIP models to a different machine to save VRAM.**
+
+These custom nodes allow you to run the **CLIP model** on one computer (The **Sender**) and use it wirelessly on another computer (The **Loader**).
 
 ---
 
-## ✨ What is this?
+## ⚙️ Installation
 
-This project adds **two custom ComfyUI nodes** that let you:
+Run this command in your `ComfyUI/custom_nodes` folder on **both computers**:
 
-* 🖥️ Run a **CLIP Worker** on one machine
-* 🎛️ Connect to it from another machine using a **CLIP Loader**
-* 🔗 Send text prompts over the network
-* 📦 Receive CLIP embeddings (`cond` + `pooled`) back in real time
-
-Both machines run **ComfyUI**, but only **one needs the CLIP model loaded**.
-
----
-
-## 🧠 How it works (simple view)
-
-```
-[ ComfyUI (Client) ]  --->  text prompt  --->  [ ComfyUI (Worker) ]
-[ Remote CLIP Loader ] <--- embeddings  <---  [ Remote CLIP Worker ]
-```
-
-* Uses **TCP sockets**
-* Sends metadata as **JSON**
-* Sends tensors as **binary blobs**
-* Automatically handles tensor shapes & dtypes
-
----
-
-## 🧩 Nodes Included
-
-### 🔹 Remote CLIP Worker
-
-🖥️ **Runs on the machine that has the CLIP model**
-
-* Listens on a TCP port
-* Receives text prompts
-* Runs CLIP encoding
-* Sends embeddings back to clients
-
-**Inputs**
-
-* `clip` → Any CLIP model
-* `listen_port` → Port to listen on (default: `8002`)
-
----
-
-### 🔹 Remote CLIP Loader
-
-🎛️ **Runs on the client machine**
-
-* Connects to the worker
-* Acts like a normal CLIP object in ComfyUI
-* Transparently forwards encoding requests
-
-**Inputs**
-
-* `worker_ip` → IP address of the worker machine
-* `port` → Worker port (default: `8002`)
-
----
-
-## ⚙️ Setup Instructions
-
-### 1️⃣ Install on both machines
-
-Clone this repository into your ComfyUI `custom_nodes` directory:
-
-```
-cd ComfyUI/custom_nodes
+```bash
 git clone https://github.com/nyueki/ComfyUI-RemoteCLIPLoader.git
-```
-
-Restart ComfyUI on **both machines**.
-
----
-
-### 2️⃣ Start the Worker (Machine A)
-
-1. Add **Remote CLIP Worker** node
-2. Connect a CLIP model
-3. Choose a port (e.g. `8002`)
-4. Queue the workflow
-
-✅ The worker is now listening for connections
-
----
-
-### 3️⃣ Connect from Client (Machine B)
-
-1. Add **Remote CLIP Loader** node
-2. Enter the worker’s IP address
-3. Match the port number
-4. Use it anywhere a CLIP node is expected 🎉
-
----
-
-## 📦 What gets transmitted?
-
-* 📝 Prompt text
-* 🔢 Tokenization options
-* 🧠 CLIP embeddings:
-
-  * `cond` → `(1, 77, 768)`
-  * `pooled` → `(1, 768)`
-
-All tensors are:
-
-* Converted to CPU
-* Sent as raw bytes
-* Reconstructed safely on the client
-
----
-
-## 🛡️ Notes & Tips
-
-* 🔌 Make sure the port is open on the worker machine
-* 🏠 Best used on local networks (LAN)
-* ⚠️ No encryption — don’t expose to the public internet
-* 🧪 Designed for simplicity & reliability
-
----
-
-## 🧰 Category in ComfyUI
 
 ```
-Remote CLIP
-```
+
+*Restart ComfyUI on both machines.*
 
 ---
 
-## ❤️ Why use this?
+## 🚀 How to Use
 
-* Save VRAM on your main machine
-* Share one powerful CLIP server
-* Experiment with distributed ComfyUI setups
-* Clean, minimal, no external dependencies
+### 1️⃣ On the "Sender" Machine
+
+*(The PC holding the CLIP model)*
+
+1. Add the **Send Remote CLIP** node.
+2. Connect your desired **CLIP model** to it.
+3. Set the `listen_port` (default `8181`).
+4. **Queue the workflow** to start listening.
+
+### 2️⃣ On the "Loader" Machine
+
+*(The PC generating images)*
+
+1. Add the **Load Remote CLIP** node.
+2. Enter the **IP address** of the Sender machine.
+3. Match the `port` number (default `8181`).
+4. Connect it to your workflow wherever a normal CLIP node is expected.
+
+---
+
+## 🎨 How to use LoRAs
+
+Because the **Loader** machine does not have the actual CLIP model loaded (it only has a "remote connection"), you cannot use a standard LoRA Loader on that machine to patch the CLIP. You have two options:
+
+### Option A: Apply LoRA to CLIP (On the Sender)
+
+If you need the LoRA to affect the text encoding (CLIP), you must load it on the **Sender** machine *before* transmitting the connection.
+
+1. On the **Sender** machine, place the **LoraLoaderCLIPOnly** node between your Checkpoint/CLIP Loader and the **Send Remote CLIP** node.
+2. Select your LoRA.
+3. Connect the output to the **Send Remote CLIP** node.
+
+### Option B: Apply LoRA to Model Only (On the Loader)
+
+If you only need the LoRA to affect the image generation (UNet/Model) and not the text prompt, do this on the **Loader** machine.
+
+1. Use the standard **LoraLoaderModelOnly** node (built into ComfyUI).
+2. Connect it to your Model/UNet on the Loader machine.
+
+---
+
+## 🛡️ Important Notes
+
+* **Firewall:** Ensure the port (default 8181) is allowed through the firewall on the Sender machine.
+* **Network:** Works best on a local home network (LAN).
+* **Security:** Do not use this over the public internet; it is not encrypted.
+
+**Node Category:** `Remote CLIP`

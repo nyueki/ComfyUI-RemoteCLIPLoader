@@ -4,6 +4,26 @@ import threading
 import json
 import torch
 import time
+import folder_paths
+import comfy.sd
+import comfy.utils
+
+class TensorEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.cpu().tolist()
+        return super().default(obj)
+    
+class TensorEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, torch.Tensor):
+            return {"__tensor__": True, "value": obj.cpu().tolist()}
+        return super().default(obj)
+
+def tensor_hook(dct):
+    if "__tensor__" in dct:
+        return torch.tensor(dct["value"])
+    return dct
 
 def log(msg):
     print(f"[RemoteCLIP {time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -18,14 +38,14 @@ def recv_exact(sock, size):
     return buf
 
 def send_packet(sock, meta, blob):
-    meta_bytes = json.dumps(meta).encode("utf-8")
+    meta_bytes = json.dumps(meta, cls=TensorEncoder).encode("utf-8")
     sock.sendall(struct.pack(">Q", len(meta_bytes)))
     sock.sendall(meta_bytes)
     sock.sendall(blob)
 
 def recv_packet(sock):
     meta_size = struct.unpack(">Q", recv_exact(sock, 8))[0]
-    meta = json.loads(recv_exact(sock, meta_size).decode("utf-8"))
+    meta = json.loads(recv_exact(sock, meta_size).decode("utf-8"), object_hook=tensor_hook)
     blob = recv_exact(sock, meta.get("blob_size", 0))
     return meta, blob
 
@@ -50,7 +70,7 @@ def unpack_tensors(meta, blob):
     offset = 0
     for name, info in meta.items():
         size = info["size"]
-        raw = blob[offset:offset + size]
+        raw = bytearray(blob[offset:offset + size])
         offset += size
         dtype = getattr(torch, info["dtype"].split(".")[-1])
         t = torch.frombuffer(raw, dtype=dtype).clone()
@@ -98,17 +118,17 @@ class RemoteCLIPProxy:
         cond, pooled = self._infer(tokens)
         return [[cond, {"pooled_output": pooled}]]
 
-class RemoteCLIPWorker:
+class SendRemoteCLIP:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"clip": ("CLIP",), "listen_port": ("INT", {"default": 8002})}}
+        return {"required": {"CLIP": ("CLIP",), "listen_port": ("INT", {"default": 8181})}}
 
     RETURN_TYPES = ()
     FUNCTION = "start_worker"
     OUTPUT_NODE = True
     CATEGORY = "Remote CLIP"
 
-    def start_worker(self, clip, listen_port):
+    def start_worker(self, CLIP, listen_port):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("0.0.0.0", listen_port))
@@ -126,8 +146,8 @@ class RemoteCLIPWorker:
                             log("Warning: invalid request, skipping")
                             continue
                         log(f"Encoding prompt ({len(meta['text'])} chars)")
-                        tokens = clip.tokenize(meta["text"], **meta["kwargs"])
-                        cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+                        tokens = CLIP.tokenize(meta["text"], **meta["kwargs"])
+                        cond, pooled = CLIP.encode_from_tokens(tokens, return_pooled=True)
                         tensor_meta, blob = pack_tensors({"cond": cond, "pooled": pooled})
                         reply_meta = {"tensors": tensor_meta, "blob_size": len(blob)}
                         send_packet(conn, reply_meta, blob)
@@ -140,10 +160,10 @@ class RemoteCLIPWorker:
             conn, _ = server.accept()
             threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
-class RemoteCLIPLoader:
+class LoadRemoteCLIP:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"worker_ip": ("STRING", {"default": "10.0.0.37"}), "port": ("INT", {"default": 8002})}}
+        return {"required": {"worker_ip": ("STRING", {"default": "127.0.0.1"}), "port": ("INT", {"default": 8181})}}
 
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_remote"
@@ -151,6 +171,27 @@ class RemoteCLIPLoader:
 
     def load_remote(self, worker_ip, port):
         return (RemoteCLIPProxy(worker_ip, port),)
+    
+class LoraLoaderCLIPOnly:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "CLIP": ("CLIP",),
+                "lora_name": (folder_paths.get_filename_list("loras"), ),
+                "strength_clip": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+            }
+        }
 
-NODE_CLASS_MAPPINGS = {"RemoteCLIPWorker": RemoteCLIPWorker, "RemoteCLIPLoader": RemoteCLIPLoader}
-NODE_DISPLAY_NAME_MAPPINGS = {"RemoteCLIPWorker": "Remote CLIP Worker", "RemoteCLIPLoader": "Remote CLIP Loader"}
+    RETURN_TYPES = ("CLIP",)
+    FUNCTION = "load_lora"
+    CATEGORY = "Remote CLIP"
+
+    def load_lora(self, CLIP, lora_name, strength_clip):
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        _, clip_lora = comfy.sd.load_lora_for_models(None, CLIP, lora, 0, strength_clip)
+        return (clip_lora,)
+
+NODE_CLASS_MAPPINGS = {"SendRemoteCLIP": SendRemoteCLIP, "LoadRemoteCLIP": LoadRemoteCLIP, "LoraLoaderCLIPOnly": LoraLoaderCLIPOnly}
+NODE_DISPLAY_NAME_MAPPINGS = {"SendRemoteCLIP": "Send Remote CLIP", "LoadRemoteCLIP": "Load Remote CLIP", "LoraLoaderCLIPOnly": "LoraLoaderCLIPOnly"}
