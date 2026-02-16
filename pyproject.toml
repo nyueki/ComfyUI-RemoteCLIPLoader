@@ -33,5 +33,5 @@ PublisherId = "nyueki"
 DisplayName = "ComfyUI-RemoteCLIPLoader"
 Icon = ""
 includes = [] 
-# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+# "requires-comfyui" = ">=1.1.0"  # ComfyUI version compatibility
 
