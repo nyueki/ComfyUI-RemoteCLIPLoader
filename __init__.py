@@ -11,12 +11,6 @@ import comfy.utils
 class TensorEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, torch.Tensor):
-            return obj.cpu().tolist()
-        return super().default(obj)
-    
-class TensorEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, torch.Tensor):
             return {"__tensor__": True, "value": obj.cpu().tolist()}
         return super().default(obj)
 
@@ -59,7 +53,7 @@ def pack_tensors(tensors):
                 t = torch.zeros((1, 77, 768))
             else:
                 t = torch.zeros((1, 768))
-        t = t.contiguous().cpu()
+        t = t.detach().contiguous().cpu()
         raw = t.numpy().tobytes()
         meta[name] = {"dtype": str(t.dtype), "shape": list(t.shape), "size": len(raw)}
         blobs.append(raw)
@@ -146,9 +140,10 @@ class SendRemoteCLIP:
                             log("Warning: invalid request, skipping")
                             continue
                         log(f"Encoding prompt ({len(meta['text'])} chars)")
-                        tokens = CLIP.tokenize(meta["text"], **meta["kwargs"])
-                        cond, pooled = CLIP.encode_from_tokens(tokens, return_pooled=True)
-                        tensor_meta, blob = pack_tensors({"cond": cond, "pooled": pooled})
+                        with torch.inference_mode():
+                            tokens = CLIP.tokenize(meta["text"], **meta["kwargs"])
+                            cond, pooled = CLIP.encode_from_tokens(tokens, return_pooled=True)
+                            tensor_meta, blob = pack_tensors({"cond": cond, "pooled": pooled})
                         reply_meta = {"tensors": tensor_meta, "blob_size": len(blob)}
                         send_packet(conn, reply_meta, blob)
                         log(f"Sent embeddings ({len(blob)} bytes)")
