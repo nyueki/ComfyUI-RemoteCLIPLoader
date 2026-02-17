@@ -69,3 +69,41 @@ If you only need the LoRA to affect the image generation (UNet/Model) and not th
 * **Security:** Do not use this over the public internet; it is not encrypted.
 
 **Node Category:** `Remote CLIP`
+
+---
+
+## 🤝 Contribution
+
+Contributions are welcome! If you have ideas for improvements, bug fixes, or new features, feel free to fork the repository and submit a Pull Request.
+
+### 🛠️ How to Submit a PR
+
+1. **Fork the Project**
+Click the "Fork" button at the top right of the repository page.
+2. **Create your Feature Branch**
+```bash
+git checkout -b feature/new-feature
+
+```
+
+
+3. **Commit your Changes**
+```bash
+git commit -m 'Add a new feature'
+
+```
+
+
+4. **Push to the Branch**
+```bash
+git push origin feature/new-feature
+
+```
+
+
+5. **Open a Pull Request**
+Go to the original repository on GitHub and click "New Pull Request".
+
+### 🐛 Found a Bug?
+
+If you encounter any issues or have a suggestion but aren't ready to code it yourself, please open an **Issue** using the tab at the top of the repository.
