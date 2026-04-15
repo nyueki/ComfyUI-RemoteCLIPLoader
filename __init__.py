@@ -115,7 +115,7 @@ class RemoteCLIPProxy:
 class SendRemoteCLIP:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"CLIP": ("CLIP",), "listen_port": ("INT", {"default": 8181})}}
+        return {"required": {"CLIP": ("CLIP",), "listen_port": ("INT", {"default": 8181, "min": 1, "max": 65535})}}
 
     RETURN_TYPES = ()
     FUNCTION = "start_worker"
@@ -158,7 +158,7 @@ class SendRemoteCLIP:
 class LoadRemoteCLIP:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"worker_ip": ("STRING", {"default": "127.0.0.1"}), "port": ("INT", {"default": 8181})}}
+        return {"required": {"worker_ip": ("STRING", {"default": "127.0.0.1"}), "port": ("INT", {"default": 8181, "min": 1, "max": 65535})}}
 
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_remote"
