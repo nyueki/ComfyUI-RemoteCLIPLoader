@@ -2,6 +2,8 @@
 
 Run the CLIP text encoder on one machine and use it from another. This is useful for offloading CLIP to a separate GPU or host to free up VRAM on the machine doing image generation.
 
+As well as text encoding (conditioning), the remote CLIP also supports text generation, so LLM-style text encoders (such as Gemma) can drive nodes like **Generate Text** and **Generate LTX2 Prompt** from across the network. Image, video, and audio inputs are forwarded to the Sender for both encoding and generation.
+
 There are two roles:
 
 - **Sender** — the machine that holds the CLIP model and runs the encoder.
@@ -48,6 +50,14 @@ Optional inputs:
 
 The Sender and Loader must run the same plugin version. A protocol mismatch is rejected with a clear error rather than producing incorrect output.
 
+## Text generation
+
+The remote CLIP works as a drop-in for generation-capable text encoders, not just plain conditioning. Connect **Load Remote CLIP** to a generation node such as **Generate Text** or **Generate LTX2 Prompt** and the prompt, sampling settings, and any image/video/audio inputs are sent to the Sender, which runs the generation and returns the text.
+
+- The model held by the Sender must actually support generation (for example a Gemma-class encoder). If it only does encoding, the generation nodes will error.
+- Generation is not cached, since sampling and seeds make each run distinct.
+- Generation can take much longer than encoding (autoregressive decoding runs token by token), so its network read uses an extended timeout and is not retried, to avoid kicking off a second expensive run on a brief hiccup. Generation speed is bound by the Sender's model and hardware, not by this plugin.
+
 ## LoRAs
 
 The text encoder runs on the Sender, so any LoRA affecting CLIP is ultimately applied there. There are two ways to set this up.
@@ -70,12 +80,12 @@ If a LoRA only needs to affect image generation (the UNet) and not the text prom
 
 ## Performance
 
-The Sender caches results to keep repeated requests fast:
+The Sender caches encoding results to keep repeated requests fast:
 
-- Embedding cache — identical prompt and settings return without re-encoding.
+- Embedding cache — an identical prompt and settings return without re-encoding. Requests carrying image/video/audio inputs are not cached.
 - Patched-CLIP cache — a given LoRA stack is applied once and reused, avoiding repeated patching.
 
-The Loader reconnects automatically if the connection drops, so brief network interruptions do not break a running workflow.
+The Loader reconnects automatically if the connection drops, so brief network interruptions do not break a running encode. Generation is the exception: it is not auto-retried, so a dropped connection mid-generation surfaces as an error rather than silently running twice.
 
 ## Notes
 
