@@ -1,109 +1,100 @@
-# 🌐 Remote CLIP for ComfyUI
+# Remote CLIP for ComfyUI
 
-**Offload heavy CLIP models to a different machine to save VRAM.**
+Run the CLIP text encoder on one machine and use it from another. This is useful for offloading CLIP to a separate GPU or host to free up VRAM on the machine doing image generation.
 
-These custom nodes allow you to run the **CLIP model** on one computer (The **Sender**) and use it wirelessly on another computer (The **Loader**).
+There are two roles:
 
----
+- **Sender** — the machine that holds the CLIP model and runs the encoder.
+- **Loader** — the machine running the workflow, which connects to the Sender in place of a local CLIP.
 
-## ⚙️ Installation
+## Installation
 
-Run this command in your `ComfyUI/custom_nodes` folder on **both computers**:
+Clone the repository into your `ComfyUI/custom_nodes` folder on both machines:
 
 ```bash
 git clone https://github.com/nyueki/ComfyUI-RemoteCLIPLoader.git
-
 ```
 
-*Restart ComfyUI on both machines.*
+Restart ComfyUI on both machines.
 
----
+## Usage
 
-## 🚀 How to Use
+### Sender
 
-### 1️⃣ On the "Sender" Machine
-
-*(The PC holding the CLIP model)*
+On the machine holding the CLIP model:
 
 1. Add the **Send Remote CLIP** node.
-2. Connect your desired **CLIP model** to it.
-3. Set the `listen_port` (default `8181`).
-4. **Queue the workflow** to start listening.
+2. Connect your CLIP model to it.
+3. Set `listen_port` (default `8181`).
+4. Optionally set an `auth_token` to require a matching secret from Loaders, and a `bind_host` to restrict the listening interface (default `0.0.0.0`, all interfaces).
+5. Queue the workflow to start listening.
 
-### 2️⃣ On the "Loader" Machine
+### Loader
 
-*(The PC generating images)*
+On the machine running the workflow:
 
 1. Add the **Load Remote CLIP** node.
-2. Enter the **IP address** of the Sender machine.
-3. Match the `port` number (default `8181`).
-4. Connect it to your workflow wherever a normal CLIP node is expected.
+2. Set `worker_ip` to the Sender's IP address.
+3. Set `port` to match the Sender (default `8181`).
+4. Connect the output anywhere a normal CLIP is expected.
 
----
+Optional inputs:
 
-## 🎨 How to use LoRAs
+- `auth_token` — A shared secret. If the Sender was started with a token, the same value must be set here or requests are rejected. Leave blank when the Sender has no token. Can also be supplied through the `REMOTE_CLIP_TOKEN` environment variable.
+- `transport_precision` — Precision of embeddings sent over the network:
+  - `auto` (default) — sends fp16 to remote hosts to save bandwidth, but keeps full precision when the worker is on localhost, where bandwidth is not a constraint.
+  - `fp16` — always send half precision. Halves bandwidth at the cost of a small precision loss; useful on slower links.
+  - `fp32` — never downcast; full precision regardless of host.
 
-Because the **Loader** machine does not have the actual CLIP model loaded (it only has a "remote connection"), you cannot use a standard LoRA Loader on that machine to patch the CLIP. You have two options:
+The Sender and Loader must run the same plugin version. A protocol mismatch is rejected with a clear error rather than producing incorrect output.
 
-### Option A: Apply LoRA to CLIP (On the Sender)
+## LoRAs
 
-If you need the LoRA to affect the text encoding (CLIP), you must load it on the **Sender** machine *before* transmitting the connection.
+The text encoder runs on the Sender, so any LoRA affecting CLIP is ultimately applied there. There are two ways to set this up.
 
-1. On the **Sender** machine, place the **LoraLoaderCLIPOnly** node between your Checkpoint/CLIP Loader and the **Send Remote CLIP** node.
-2. Select your LoRA.
-3. Connect the output to the **Send Remote CLIP** node.
+### Apply on the Sender
 
-### Option B: Apply LoRA to Model Only (On the Loader)
+Place the **LoraLoaderCLIPOnly** node between the Checkpoint or CLIP Loader and the **Send Remote CLIP** node on the Sender. Select the LoRA, set `strength_clip`, and connect the output to **Send Remote CLIP**.
 
-If you only need the LoRA to affect the image generation (UNet/Model) and not the text prompt, do this on the **Loader** machine.
+### Apply from the Loader
 
-1. Use the standard **LoraLoaderModelOnly** node (built into ComfyUI).
-2. Connect it to your Model/UNet on the Loader machine.
+You can also place **LoraLoaderCLIPOnly** on the Loader, right after **Load Remote CLIP**. When it detects a remote connection it does not patch locally; instead it forwards the LoRA name and strength to the Sender, which applies them.
 
----
+- The LoRA file must exist in the Sender's `loras` folder. The Loader only sends the name and strength, so a missing file fails with a "LoRA not found on worker" error.
+- Multiple `LoraLoaderCLIPOnly` nodes can be stacked; they accumulate and are all applied on the Sender.
+- The standard ComfyUI LoRA Loader does not work against a remote CLIP. Use **LoraLoaderCLIPOnly**.
 
-## 🛡️ Important Notes
+### Model-only LoRAs
 
-* **Firewall:** Ensure the port (default 8181) is allowed through the firewall on the Sender machine.
-* **Network:** Works best on a local home network (LAN).
-* **Security:** Do not use this over the public internet; it is not encrypted.
+If a LoRA only needs to affect image generation (the UNet) and not the text prompt, use the standard **LoraLoaderModelOnly** node on the Loader as usual.
 
-**Node Category:** `Remote CLIP`
+## Performance
 
----
+The Sender caches results to keep repeated requests fast:
 
-## 🤝 Contribution
+- Embedding cache — identical prompt and settings return without re-encoding.
+- Patched-CLIP cache — a given LoRA stack is applied once and reused, avoiding repeated patching.
 
-Contributions are welcome! If you have ideas for improvements, bug fixes, or new features, feel free to fork the repository and submit a Pull Request.
+The Loader reconnects automatically if the connection drops, so brief network interruptions do not break a running workflow.
 
-### 🛠️ How to Submit a PR
+## Notes
 
-1. **Fork the Project**
-Click the "Fork" button at the top right of the repository page.
-2. **Create your Feature Branch**
-```bash
-git checkout -b feature/new-feature
+- Authentication: when exposing the Sender on a shared network, set the same `auth_token` on both nodes. If the Sender binds to `0.0.0.0` without a token, anyone on the network can use the model, and the Sender logs a warning.
+- Bind host: the Sender binds to `0.0.0.0` by default. Set `bind_host` to a specific address to restrict access.
+- Firewall: allow the listening port (default 8181) through the firewall on the Sender.
+- Network: intended for use on a local network.
+- Encryption: traffic is not encrypted. Do not expose this directly over the public internet; tunnel it through a VPN or SSH instead.
 
-```
+Node category: `Remote CLIP`
 
+## Contributing
 
-3. **Commit your Changes**
-```bash
-git commit -m 'Add a new feature'
+Contributions are welcome, whether bug fixes, improvements, or new features.
 
-```
+1. Fork the repository.
+2. Create a feature branch: `git checkout -b feature/new-feature`
+3. Commit your changes: `git commit -m 'Add a new feature'`
+4. Push the branch: `git push origin feature/new-feature`
+5. Open a pull request against the original repository.
 
-
-4. **Push to the Branch**
-```bash
-git push origin feature/new-feature
-
-```
-
-
-5. **Open a Pull Request**
-Go to the original repository on GitHub and click "New Pull Request".
-
-### 🐛 Found a Bug?
-
-If you encounter any issues or have a suggestion but aren't ready to code it yourself, please open an **Issue** using the tab at the top of the repository.
+If you find a bug or have a suggestion but aren't ready to implement it, please open an issue.
