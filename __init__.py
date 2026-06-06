@@ -11,10 +11,11 @@ import folder_paths
 import comfy.sd
 import comfy.utils
 DEFAULT_PORT = 8181
-PROTOCOL_VERSION = 1                   
+PROTOCOL_VERSION = 2                   
 HEADER_LEN_FMT = ">Q"                 
 HEADER_LEN_SIZE = struct.calcsize(HEADER_LEN_FMT)
 SOCKET_TIMEOUT = 120                  
+GENERATE_TIMEOUT = 3600               
 CONNECT_RETRIES = 3
 CONNECT_BACKOFF = 1.0                 
 RECV_CHUNK = 1 << 20                  
@@ -26,24 +27,19 @@ ALLOWED_DTYPES = {
     "torch.float32": torch.float32,
     "torch.float16": torch.float16,
     "torch.bfloat16": torch.bfloat16,
+    "torch.int64": torch.int64,
+    "torch.int32": torch.int32,
+    "torch.uint8": torch.uint8,
+    "torch.bool": torch.bool,
 }
 def log(msg):
     print(f"[RemoteCLIP {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 def resolve_transport_dtype(mode, ip):
-    """Map a transport mode + worker host to a transport dtype string.
-    Returns a key into ALLOWED_DTYPES, or None to send tensors as-is (no
-    downcast, full precision).
-      - "fp16": always send float tensors as float16 (half the bandwidth).
-      - "fp32": never downcast; preserve full precision.
-      - "auto": fp16 for remote workers (bandwidth matters), full precision
-                on localhost (bandwidth is free, so don't lose precision).
-    """
     if mode == "fp16":
         return "torch.float16"
     if mode == "fp32":
         return None
-    # auto
     is_local = ip in _LOCAL_HOSTS
     return None if is_local else "torch.float16"
 def _recv_exact(sock, size):
@@ -63,13 +59,11 @@ def send_packet(sock, header, blob=b""):
     if blob:
         sock.sendall(blob)
 def recv_header(sock):
-    """Read and parse just the JSON header (no blob)."""
     header_len = struct.unpack(HEADER_LEN_FMT, _recv_exact(sock, HEADER_LEN_SIZE))[0]
     if header_len > MAX_HEADER_BYTES:
         raise ValueError(f"Header too large: {header_len} bytes")
     return json.loads(_recv_exact(sock, header_len).decode("utf-8"))
 def recv_blob(sock, header):
-    """Read the blob declared by a previously-read header."""
     blob_size = header.get("blob_size", 0)
     if blob_size > MAX_BLOB_BYTES:
         raise ValueError(f"Blob too large: {blob_size} bytes")
@@ -82,11 +76,6 @@ def _set_socket_opts(sock):
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.settimeout(SOCKET_TIMEOUT)
 def pack_tensors(tensors, transport_dtype=None):
-    """Serialize {name: tensor} into (metadata, blob).
-    transport_dtype: optional torch dtype to cast floating tensors to before
-    transfer (e.g. float16 to halve bandwidth). The original dtype is recorded
-    so the receiver can restore it.
-    """
     meta = {}
     blobs = []
     offset = 0
@@ -122,15 +111,30 @@ def unpack_tensors(meta, blob):
         dtype = ALLOWED_DTYPES[dtype_name]
         start = info["offset"]
         raw = bytearray(view[start:start + info["size"]])
-        # .clone() so the tensor owns its memory instead of aliasing `raw`.
         t = torch.frombuffer(raw, dtype=dtype).reshape(info["shape"]).clone()
         orig = info.get("orig_dtype")
         if orig in ALLOWED_DTYPES and ALLOWED_DTYPES[orig] != dtype:
             t = t.to(ALLOWED_DTYPES[orig])
         out[name] = t
     return out
+def extract_tensors(obj, prefix, out):
+    if isinstance(obj, torch.Tensor):
+        out[prefix] = obj
+        return {"__tensor__": prefix}
+    if isinstance(obj, dict):
+        return {k: extract_tensors(v, f"{prefix}.{k}", out) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [extract_tensors(v, f"{prefix}.{i}", out) for i, v in enumerate(obj)]
+    return obj
+def restore_tensors(obj, tensors):
+    if isinstance(obj, dict):
+        if len(obj) == 1 and "__tensor__" in obj:
+            return tensors[obj["__tensor__"]]
+        return {k: restore_tensors(v, tensors) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [restore_tensors(v, tensors) for v in obj]
+    return obj
 class _Connection:
-    """Thread-safe, reconnecting TCP connection to a worker. Shared by proxy clones."""
     def __init__(self, ip, port, auth_token=""):
         self.ip = ip
         self.port = port
@@ -163,24 +167,27 @@ class _Connection:
             except OSError:
                 pass
             self._sock = None
-    def request(self, header, blob=b""):
-        """Send a request, return (header, blob). Reconnects once on failure."""
+    def request(self, header, blob=b"", response_timeout=None, retries=2):
         if self.auth_token:
             header = {**header, "auth": self.auth_token}
         with self._lock:
-            for attempt in (1, 2):
+            for attempt in range(1, retries + 1):
                 try:
                     if self._sock is None:
                         self._connect()
+                    if response_timeout is not None:
+                        self._sock.settimeout(response_timeout)
                     send_packet(self._sock, header, blob)
-                    return recv_packet(self._sock)
+                    resp = recv_packet(self._sock)
+                    if response_timeout is not None:
+                        self._sock.settimeout(SOCKET_TIMEOUT)
+                    return resp
                 except (ConnectionError, OSError, struct.error, ValueError) as e:
-                    log(f"Request failed ({e}); reconnecting (attempt {attempt})")
+                    log(f"Request failed ({e}); reconnecting (attempt {attempt}/{retries})")
                     self._close()
-                    if attempt == 2:
+                    if attempt == retries:
                         raise
 class RemoteCLIPProxy:
-    """Stands in for a ComfyUI CLIP object but encodes on a remote worker."""
     def __init__(self, ip, port, auth_token="", transport_mode="auto",
                  connection=None, lora_stack=None):
         self.ip = ip
@@ -189,7 +196,7 @@ class RemoteCLIPProxy:
         self.transport_dtype = resolve_transport_dtype(transport_mode, ip)
         self._conn = connection or _Connection(ip, port, auth_token)
         self.lora_stack = list(lora_stack or [])
-    def clone(self):
+    def clone(self, disable_dynamic=False):
         return RemoteCLIPProxy(
             self.ip, self.port,
             transport_mode=self.transport_mode,
@@ -205,35 +212,82 @@ class RemoteCLIPProxy:
             "Apply LoRAs to a remote CLIP with the 'LoraLoaderCLIPOnly' node, "
             "which forwards them to the worker."
         )
-    def tokenize(self, text, **kwargs):
+    def tokenize(self, text, return_word_ids=False, **kwargs):
+        if return_word_ids:
+            kwargs["return_word_ids"] = True
         return {"text": text, "kwargs": kwargs, "lora_stack": self.lora_stack}
-    def _infer(self, tokens):
+    def _encode(self, tokens):
+        kwargs = dict(tokens.get("kwargs", {}))
+        tensor_inputs = {}
+        kwargs = extract_tensors(kwargs, "kwargs", tensor_inputs)
+        if tensor_inputs:
+            in_meta, in_blob = pack_tensors(tensor_inputs, self.transport_dtype)
+        else:
+            in_meta, in_blob = {}, b""
         header = {
             "cmd": "encode",
             "proto": PROTOCOL_VERSION,
             "text": tokens["text"],
-            "kwargs": tokens.get("kwargs", {}),
+            "kwargs": kwargs,
             "lora_stack": tokens.get("lora_stack", self.lora_stack),
+            "tensor_inputs": in_meta,
             "transport_dtype": self.transport_dtype,
-            "blob_size": 0,
+            "blob_size": len(in_blob),
         }
         log("Sending encode request")
-        resp, blob = self._conn.request(header)
+        resp, blob = self._conn.request(header, in_blob)
         if resp.get("error"):
             raise RuntimeError(f"Remote CLIP worker error: {resp['error']}")
         tensors = unpack_tensors(resp["tensors"], blob)
+        out = restore_tensors(resp["struct"], tensors)
         log("Received embeddings")
-        return tensors["cond"], tensors["pooled"]
-    def encode_from_tokens(self, tokens, return_pooled=True, return_dict=False):
-        cond, pooled = self._infer(tokens)
+        return out
+    def encode_from_tokens(self, tokens, return_pooled=False, return_dict=False):
+        out = self._encode(tokens)
         if return_dict:
-            return {"cond": cond, "pooled_output": pooled}
+            return out
+        cond = out["cond"]
         if return_pooled:
-            return cond, pooled
+            return cond, out.get("pooled_output")
         return cond
-    def encode_from_tokens_scheduled(self, tokens):
-        cond, pooled = self._infer(tokens)
-        return [[cond, {"pooled_output": pooled}]]
+    def encode_from_tokens_scheduled(self, tokens, unprojected=False, add_dict: dict = None, show_pbar=True):
+        return_pooled = "unprojected" if unprojected else True
+        pooled_dict = self.encode_from_tokens(tokens, return_pooled=return_pooled, return_dict=True)
+        cond = pooled_dict.pop("cond")
+        if add_dict:
+            pooled_dict.update(add_dict)
+        return [[cond, pooled_dict]]
+    def generate(self, tokens, **gen_kwargs):
+        text = tokens["text"]
+        kwargs = dict(tokens.get("kwargs", {}))
+        lora_stack = tokens.get("lora_stack", self.lora_stack)
+        tensor_inputs = {}
+        kwargs = extract_tensors(kwargs, "kwargs", tensor_inputs)
+        if tensor_inputs:
+            meta, blob = pack_tensors(tensor_inputs, self.transport_dtype)
+        else:
+            meta, blob = {}, b""
+        header = {
+            "cmd": "generate",
+            "proto": PROTOCOL_VERSION,
+            "text": text,
+            "kwargs": kwargs,
+            "gen_kwargs": gen_kwargs,
+            "lora_stack": lora_stack,
+            "tensor_inputs": meta,
+            "transport_dtype": self.transport_dtype,
+            "blob_size": len(blob),
+        }
+        log("Sending generate request")
+        resp, _ = self._conn.request(
+            header, blob, response_timeout=GENERATE_TIMEOUT, retries=1
+        )
+        if resp.get("error"):
+            raise RuntimeError(f"Remote CLIP worker error: {resp['error']}")
+        log("Received generated text")
+        return resp["text"]
+    def decode(self, generated):
+        return generated
 class _Worker:
     def __init__(self, clip, auth_token=""):
         self.base_clip = clip
@@ -267,39 +321,49 @@ class _Worker:
             self._patched_clips.popitem(last=False)
         return clip
     def encode(self, text, kwargs, lora_stack):
-        cache_key = self._sig([text, kwargs, lora_stack])
-        # Fast path: serve cached embeddings without blocking on GPU inference.
-        with self._cache_lock:
-            cached = self._embed_cache.get(cache_key)
-            if cached is not None:
-                self._embed_cache.move_to_end(cache_key)
-                return cached
-        # Slow path: serialize the actual GPU work on its own lock so that
-        # concurrent cache hits aren't stuck behind an in-flight encode.
-        with self._infer_lock:
-            # Re-check: another thread may have computed this while we waited.
+        try:
+            cache_key = self._sig([text, kwargs, lora_stack])
+        except TypeError:
+            cache_key = None
+        if cache_key is not None:
             with self._cache_lock:
                 cached = self._embed_cache.get(cache_key)
                 if cached is not None:
                     self._embed_cache.move_to_end(cache_key)
                     return cached
+        with self._infer_lock:
+            if cache_key is not None:
+                with self._cache_lock:
+                    cached = self._embed_cache.get(cache_key)
+                    if cached is not None:
+                        self._embed_cache.move_to_end(cache_key)
+                        return cached
             clip = self._get_clip(lora_stack)
             with torch.inference_mode():
                 tokens = clip.tokenize(text, **kwargs)
-                cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
-            cond = cond.detach().cpu()
-            if pooled is None:
-                pooled = torch.zeros((cond.shape[0], cond.shape[-1]))
-            else:
-                pooled = pooled.detach().cpu()
-            # Clone before caching so a downstream in-place mutation on the
-            # returned tensors can never poison the cache.
-            result = (cond.clone(), pooled.clone())
-            with self._cache_lock:
-                self._embed_cache[cache_key] = result
-                while len(self._embed_cache) > EMBED_CACHE:
-                    self._embed_cache.popitem(last=False)
+                out = clip.encode_from_tokens(tokens, return_dict=True)
+            cond = out.get("cond")
+            if cond is None:
+                raise RuntimeError("encode produced no cond tensor")
+            result = {}
+            for k, v in out.items():
+                result[k] = v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v
+            if result.get("pooled_output") is None:
+                result["pooled_output"] = torch.zeros((cond.shape[0], cond.shape[-1]))
+            if cache_key is not None:
+                with self._cache_lock:
+                    self._embed_cache[cache_key] = result
+                    while len(self._embed_cache) > EMBED_CACHE:
+                        self._embed_cache.popitem(last=False)
             return result
+    def generate(self, text, kwargs, gen_kwargs, lora_stack):
+        with self._infer_lock:
+            clip = self._get_clip(lora_stack)
+            with torch.inference_mode():
+                tokens = clip.tokenize(text, **kwargs)
+                generated_ids = clip.generate(tokens, **gen_kwargs)
+                generated_text = clip.decode(generated_ids)
+        return generated_text
 class SendRemoteCLIP:
     _servers = {}  
     @classmethod
@@ -342,9 +406,6 @@ class SendRemoteCLIP:
             try:
                 _set_socket_opts(conn)
                 while True:
-                    # Read only the header first. The blob is read after the
-                    # client is authorized, so an unauthenticated peer can't
-                    # make us buffer a large (up to MAX_BLOB_BYTES) payload.
                     header = recv_header(conn)
                     if token and not hmac.compare_digest(header.get("auth", ""), token):
                         send_packet(conn, {"error": "unauthorized", "blob_size": 0})
@@ -360,27 +421,56 @@ class SendRemoteCLIP:
                         log(f"Rejected client {addr}: protocol v{client_proto} "
                             f"!= v{PROTOCOL_VERSION}")
                         break
-                    # Authorized: now it's safe to read any declared blob.
-                    recv_blob(conn, header)
-                    if header.get("cmd") != "encode" or "text" not in header:
+                    blob_data = recv_blob(conn, header)
+                    cmd = header.get("cmd")
+                    if cmd == "encode" and "text" in header:
+                        try:
+                            transport = header.get("transport_dtype")
+                            transport_dtype = ALLOWED_DTYPES.get(transport) if transport else None
+                            input_tensors = unpack_tensors(
+                                header.get("tensor_inputs", {}), blob_data
+                            )
+                            enc_kwargs = restore_tensors(
+                                header.get("kwargs", {}), input_tensors
+                            )
+                            out = worker.encode(
+                                header["text"],
+                                enc_kwargs,
+                                header.get("lora_stack", []),
+                            )
+                            tensors = {}
+                            out_struct = extract_tensors(out, "out", tensors)
+                            meta, blob = pack_tensors(tensors, transport_dtype)
+                            send_packet(
+                                conn,
+                                {"struct": out_struct, "tensors": meta, "blob_size": len(blob)},
+                                blob,
+                            )
+                            log(f"Sent embeddings ({len(blob)} bytes)")
+                        except Exception as e:
+                            log(f"Encode failed: {e}")
+                            send_packet(conn, {"error": str(e), "blob_size": 0})
+                    elif cmd == "generate" and "text" in header:
+                        try:
+                            input_tensors = unpack_tensors(
+                                header.get("tensor_inputs", {}), blob_data
+                            )
+                            kwargs = restore_tensors(
+                                header.get("kwargs", {}), input_tensors
+                            )
+                            generated_text = worker.generate(
+                                header["text"],
+                                kwargs,
+                                header.get("gen_kwargs", {}),
+                                header.get("lora_stack", []),
+                            )
+                            send_packet(conn, {"text": generated_text, "blob_size": 0})
+                            log("Sent generated text")
+                        except Exception as e:
+                            log(f"Generate failed: {e}")
+                            send_packet(conn, {"error": str(e), "blob_size": 0})
+                    else:
                         send_packet(conn, {"error": "bad request", "blob_size": 0})
-                        continue
-                    try:
-                        transport = header.get("transport_dtype")
-                        transport_dtype = ALLOWED_DTYPES.get(transport) if transport else None
-                        cond, pooled = worker.encode(
-                            header["text"],
-                            header.get("kwargs", {}),
-                            header.get("lora_stack", []),
-                        )
-                        meta, blob = pack_tensors(
-                            {"cond": cond, "pooled": pooled}, transport_dtype
-                        )
-                        send_packet(conn, {"tensors": meta, "blob_size": len(blob)}, blob)
-                        log(f"Sent embeddings ({len(blob)} bytes)")
-                    except Exception as e:
-                        log(f"Encode failed: {e}")
-                        send_packet(conn, {"error": str(e), "blob_size": 0})
             except (ConnectionError, OSError) as e:
                 log(f"Client {addr} disconnected: {e}")
             finally:
