@@ -193,7 +193,12 @@ class RemoteCLIPProxy:
         self.ip = ip
         self.port = port
         self.transport_mode = transport_mode
-        self.transport_dtype = resolve_transport_dtype(transport_mode, ip)
+        self.transport_dtype_name = resolve_transport_dtype(transport_mode, ip)
+        self.transport_dtype = (
+            ALLOWED_DTYPES[self.transport_dtype_name]
+            if self.transport_dtype_name is not None
+            else None
+        )
         self._conn = connection or _Connection(ip, port, auth_token)
         self.lora_stack = list(lora_stack or [])
     def clone(self, disable_dynamic=False):
@@ -231,7 +236,7 @@ class RemoteCLIPProxy:
             "kwargs": kwargs,
             "lora_stack": tokens.get("lora_stack", self.lora_stack),
             "tensor_inputs": in_meta,
-            "transport_dtype": self.transport_dtype,
+            "transport_dtype": self.transport_dtype_name,
             "blob_size": len(in_blob),
         }
         log("Sending encode request")
@@ -275,7 +280,7 @@ class RemoteCLIPProxy:
             "gen_kwargs": gen_kwargs,
             "lora_stack": lora_stack,
             "tensor_inputs": meta,
-            "transport_dtype": self.transport_dtype,
+            "transport_dtype": self.transport_dtype_name,
             "blob_size": len(blob),
         }
         log("Sending generate request")
